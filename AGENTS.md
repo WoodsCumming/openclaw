@@ -1,3 +1,25 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What Is OpenClaw
+
+OpenClaw is a **multi-channel AI gateway** — a local-first control plane that connects AI agents (Pi runtime via ACP) to messaging platforms (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Microsoft Teams, Google Chat, Matrix, Zalo, WebChat, and extension channels). The Gateway runs as a WebSocket server (`ws://127.0.0.1:18789`); native apps (macOS/iOS/Android) connect as clients. Users interact through their preferred messaging channel; OpenClaw routes messages to the right agent, executes tools, and delivers replies back.
+
+**Key architectural layers:**
+- **Gateway** (`src/gateway/`) — WebSocket control plane; orchestrates channels, agents, sessions, auth, cron, browser sessions
+- **Channels** (`src/channels/` + `extensions/*/`) — Adapter plugins per messaging platform; each implements typed adapter interfaces (messaging, security, threading, commands, status, etc.)
+- **Agents** (`src/agents/`) — Pi agent runtime integration (ACP RPC protocol), tool execution, session/scope management, sandbox support
+- **Routing** (`src/routing/`) — Multi-level route resolution: peer → parent-peer → guild+roles → guild → team → account → channel → default agent
+- **Plugins** (`src/plugins/`) — Hook system (20+ hook points: before/after agent turn, tool call, LLM call, channel send) + HTTP route extensions
+- **CLI** (`src/cli/` + `src/commands/`) — Commander.js program; entry via `src/index.ts` → `buildProgram()`
+- **Native apps** (`apps/macos/`, `apps/ios/`, `apps/android/`, `apps/shared/OpenClawKit/`) — Optional companion apps for voice, camera, Canvas, and device-local actions
+- **Canvas/A2UI** (`src/canvas-host/`) — Express + WebSocket server for agent-driven visual workspaces
+
+**Session key format:** `agent-{id}:account-{acctId}:channel-{ch}:peer-{peerId}:type-{chatType}` (main session collapses to `agent-{id}:main`).
+
+**Plugin SDK:** `src/plugin-sdk/index.ts` is the public surface for extension authors; runtime resolves `openclaw/plugin-sdk` via jiti alias.
+
 # Repository Guidelines
 
 - Repo: https://github.com/openclaw/openclaw
@@ -69,6 +91,8 @@
 - Format check: `pnpm format` (oxfmt --check)
 - Format fix: `pnpm format:fix` (oxfmt --write)
 - Tests: `pnpm test` (vitest); coverage: `pnpm test:coverage`
+- Run a single test file: `pnpm test src/path/to/file.test.ts`
+- Run tests matching a name pattern: `pnpm test -- --reporter=verbose -t "pattern"`
 
 ## Coding Style & Naming Conventions
 
