@@ -40,6 +40,30 @@ const log = createSubsystemLogger("memory");
 
 const INDEX_CACHE = new Map<string, MemoryIndexManager>();
 
+/**
+ * 记忆索引管理器，OpenClaw 向量记忆系统的核心类。
+ *
+ * 功能：
+ * - 将文本（会话内容、文档等）嵌入为向量并存储到 SQLite-vec 或 LanceDB
+ * - 支持向量相似度搜索、BM25 全文搜索和混合检索
+ * - 嵌入结果缓存，避免重复 API 调用
+ * - 支持增量同步和原子重索引
+ * - 时序衰减：对旧记忆降权，优先返回近期相关内容
+ * - MMR（最大边际相关性）去重，提高检索多样性
+ *
+ * 支持的嵌入 Provider：
+ * - openai：text-embedding-3-small / large
+ * - gemini：text-embedding-004
+ * - voyage：voyage-3 / voyage-code-3
+ * - mistral：mistral-embed
+ * - local：本地 HuggingFace 模型
+ * - auto：自动选择可用 provider
+ *
+ * 使用单例缓存（INDEX_CACHE），同一 cacheKey 复用实例。
+ *
+ * @extends MemoryManagerEmbeddingOps
+ * @implements MemorySearchManager
+ */
 export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements MemorySearchManager {
   private readonly cacheKey: string;
   protected readonly cfg: OpenClawConfig;

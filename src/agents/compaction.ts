@@ -8,6 +8,11 @@ import { repairToolUseResultPairing, stripToolResultDetails } from "./session-tr
 
 const log = createSubsystemLogger("compaction");
 
+/**
+ * 会话历史压缩的基础分块比例（40%）。
+ * 每次压缩时保留最近 60% 的历史，压缩最旧的 40%。
+ * 实际比例由 computeAdaptiveChunkRatio 根据消息大小动态调整。
+ */
 export const BASE_CHUNK_RATIO = 0.4;
 export const MIN_CHUNK_RATIO = 0.15;
 export const SAFETY_MARGIN = 1.2; // 20% buffer for estimateTokens() inaccuracy
@@ -17,6 +22,15 @@ const MERGE_SUMMARIES_INSTRUCTIONS =
   "Merge these partial summaries into a single cohesive summary. Preserve decisions," +
   " TODOs, open questions, and any constraints.";
 
+/**
+ * 估算消息列表的总 token 数。
+ *
+ * 安全注意：先通过 stripToolResultDetails 剥离工具调用结果的详细内容，
+ * 防止不可信的工具输出（如 bash 命令输出）被计入 LLM 面向的 token 估算。
+ *
+ * @param messages - 待估算的消息列表
+ * @returns 估算的总 token 数（使用 chars/4 启发式，可能低估多字节字符）
+ */
 export function estimateMessagesTokens(messages: AgentMessage[]): number {
   // SECURITY: toolResult.details can contain untrusted/verbose payloads; never include in LLM-facing compaction.
   const safe = stripToolResultDetails(messages);
@@ -34,6 +48,16 @@ function normalizeParts(parts: number, messageCount: number): number {
   return Math.min(Math.max(1, Math.floor(parts)), Math.max(1, messageCount));
 }
 
+/**
+ * 按 token 份额将消息列表均等分割为多个块。
+ *
+ * 用于并行压缩：将长历史分成 N 个大小接近的块，分别生成摘要，再合并。
+ * 分割点在消息边界，不会切割单条消息。
+ *
+ * @param messages - 待分割的消息列表
+ * @param parts - 目标块数（默认 2），实际块数不超过消息数
+ * @returns 分割后的消息块数组（可能少于 parts 个）
+ */
 export function splitMessagesByTokenShare(
   messages: AgentMessage[],
   parts = DEFAULT_PARTS,
@@ -75,11 +99,23 @@ export function splitMessagesByTokenShare(
   return chunks;
 }
 
-// Overhead reserved for summarization prompt, system prompt, previous summary,
-// and serialization wrappers (<conversation> tags, instructions, etc.).
-// generateSummary uses reasoning: "high" which also consumes context budget.
+/**
+ * 摘要生成预留的 overhead token 数（4096）。
+ * 包含：摘要 prompt、system prompt、前一次摘要、XML 标签包装等。
+ * generateSummary 使用 reasoning:"high" 也会消耗额外上下文预算。
+ */
 export const SUMMARIZATION_OVERHEAD_TOKENS = 4096;
 
+/**
+ * 按最大 token 数将消息列表切割为多个块。
+ *
+ * 应用 SAFETY_MARGIN（1.2x）补偿 estimateTokens 的低估（多字节字符、代码 token 等）。
+ * 超过单条消息自身超过 effectiveMax 时，单独成块（防止无限增长）。
+ *
+ * @param messages - 待切割的消息列表
+ * @param maxTokens - 每块的最大 token 数（应用安全裕度前）
+ * @returns 切割后的消息块数组
+ */
 export function chunkMessagesByMaxTokens(
   messages: AgentMessage[],
   maxTokens: number,
@@ -123,8 +159,14 @@ export function chunkMessagesByMaxTokens(
 }
 
 /**
- * Compute adaptive chunk ratio based on average message size.
- * When messages are large, we use smaller chunks to avoid exceeding model limits.
+ * 根据平均消息大小自适应计算分块比例。
+ *
+ * 当平均消息超过上下文窗口的 10% 时，降低分块比例（压缩更多历史），
+ * 防止单块超出模型限制。比例范围：[MIN_CHUNK_RATIO=0.15, BASE_CHUNK_RATIO=0.4]。
+ *
+ * @param messages - 历史消息列表
+ * @param contextWindow - 当前模型的上下文窗口大小（token 数）
+ * @returns 自适应分块比例
  */
 export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindow: number): number {
   if (messages.length === 0) {
@@ -148,8 +190,10 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
 }
 
 /**
- * Check if a single message is too large to summarize.
- * If single message > 50% of context, it can't be summarized safely.
+ * 判断单条消息是否因体积过大而无法安全摘要。
+ * 若消息（含安全裕度）超过上下文窗口的 50%，则无法在单次摘要中处理。
+ * @param msg - 待检查的消息
+ * @param contextWindow - 模型上下文窗口大小
  */
 export function isOversizedForSummary(msg: AgentMessage, contextWindow: number): boolean {
   const tokens = estimateCompactionMessageTokens(msg) * SAFETY_MARGIN;
@@ -202,8 +246,14 @@ async function summarizeChunks(params: {
 }
 
 /**
- * Summarize with progressive fallback for handling oversized messages.
- * If full summarization fails, tries partial summarization excluding oversized messages.
+ * 带渐进式降级的摘要生成函数。
+ *
+ * 降级策略（依次尝试）：
+ * 1. 对全部消息生成摘要
+ * 2. 跳过超大消息，仅对小消息生成摘要，并附注跳过的消息
+ * 3. 返回纯文本说明（消息数量 + 无法摘要的原因）
+ *
+ * @param params.contextWindow - 用于判断消息是否过大的上下文窗口大小
  */
 export async function summarizeWithFallback(params: {
   messages: AgentMessage[];
@@ -273,6 +323,18 @@ export async function summarizeWithFallback(params: {
   );
 }
 
+/**
+ * 分阶段摘要：将历史消息按 token 份额分块，各块独立摘要后合并。
+ *
+ * 适用于消息总量远超单次摘要能力的场景。
+ * 若消息数不足 minMessagesForSplit 或总 token 在 maxChunkTokens 以内，
+ * 退化为单次 summarizeWithFallback。
+ *
+ * 合并时使用 MERGE_SUMMARIES_INSTRUCTIONS 指导模型保留决策、TODO 和约束。
+ *
+ * @param params.parts - 分割块数（默认 2）
+ * @param params.minMessagesForSplit - 触发分块的最小消息数（默认 4）
+ */
 export async function summarizeInStages(params: {
   messages: AgentMessage[];
   model: NonNullable<ExtensionContext["model"]>;
@@ -336,6 +398,20 @@ export async function summarizeInStages(params: {
   });
 }
 
+/**
+ * 裁剪历史消息以适配上下文窗口的历史预算。
+ *
+ * 核心机制：
+ * 1. 计算历史 token 预算 = maxContextTokens * maxHistoryShare（默认 50%）
+ * 2. 循环将消息按 token 份额分块，丢弃最旧的块，直到总量在预算内
+ * 3. 每次丢弃后调用 repairToolUseResultPairing 修复孤立的 tool_result
+ *    （其对应的 tool_use 已被丢弃，不修复会导致 Anthropic API 报错）
+ *
+ * @param params.messages - 完整历史消息
+ * @param params.maxContextTokens - 模型上下文窗口大小
+ * @param params.maxHistoryShare - 历史可占用的最大比例（默认 0.5）
+ * @returns 裁剪后的消息及统计信息（丢弃块数、消息数、token 数）
+ */
 export function pruneHistoryForContextShare(params: {
   messages: AgentMessage[];
   maxContextTokens: number;
@@ -400,6 +476,12 @@ export function pruneHistoryForContextShare(params: {
   };
 }
 
+/**
+ * 从模型元数据中解析上下文窗口 token 数。
+ * 若模型未提供 contextWindow，回退到 DEFAULT_CONTEXT_TOKENS。
+ * @param model - Pi SDK 的模型元数据（可选）
+ * @returns 上下文窗口 token 数（至少为 1）
+ */
 export function resolveContextWindowTokens(model?: ExtensionContext["model"]): number {
   return Math.max(1, Math.floor(model?.contextWindow ?? DEFAULT_CONTEXT_TOKENS));
 }

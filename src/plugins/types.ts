@@ -19,6 +19,10 @@ import type { PluginRuntime } from "./runtime/types.js";
 export type { PluginRuntime } from "./runtime/types.js";
 export type { AnyAgentTool } from "../agents/tools/common.js";
 
+/**
+ * 插件日志接口，由 Gateway 注入，插件通过此接口输出日志。
+ * debug 为可选（某些环境不支持 debug 级别日志）。
+ */
 export type PluginLogger = {
   debug?: (message: string) => void;
   info: (message: string) => void;
@@ -35,12 +39,21 @@ export type PluginConfigUiHint = {
   placeholder?: string;
 };
 
+/** 插件类型标识。目前仅支持 "memory"（记忆后端插件）。 */
 export type PluginKind = "memory";
 
 export type PluginConfigValidation =
   | { ok: true; value?: unknown }
   | { ok: false; errors: string[] };
 
+/**
+ * 插件配置 schema 定义，支持多种验证方式。
+ * - safeParse：Zod 风格的安全解析（不抛出异常）
+ * - parse：严格解析（失败时抛出）
+ * - validate：自定义验证函数
+ * - uiHints：Web 控制台配置表单的 UI 提示
+ * - jsonSchema：JSON Schema 格式的 schema（用于文档生成）
+ */
 export type OpenClawPluginConfigSchema = {
   safeParse?: (value: unknown) => {
     success: boolean;
@@ -55,6 +68,16 @@ export type OpenClawPluginConfigSchema = {
   jsonSchema?: Record<string, unknown>;
 };
 
+/**
+ * 插件工具的运行时上下文，在工具被调用时由 Gateway 注入。
+ * @property config - 当前 OpenClaw 配置（只读）
+ * @property workspaceDir - agent 工作区目录（工具执行的根目录）
+ * @property agentDir - agent 数据目录（会话、技能等）
+ * @property agentId - 当前 agent ID
+ * @property sessionKey - 当前会话 key
+ * @property messageChannel - 消息来源渠道（如 "telegram"）
+ * @property sandboxed - 是否在 Docker 沙箱中运行
+ */
 export type OpenClawPluginToolContext = {
   config?: OpenClawConfig;
   workspaceDir?: string;
@@ -66,6 +89,11 @@ export type OpenClawPluginToolContext = {
   sandboxed?: boolean;
 };
 
+/**
+ * 插件工具工厂函数类型。
+ * 每次 agent 执行时调用，根据运行时上下文动态创建工具实例。
+ * 返回 null/undefined 表示该上下文不需要此工具。
+ */
 export type OpenClawPluginToolFactory = (
   ctx: OpenClawPluginToolContext,
 ) => AnyAgentTool | AnyAgentTool[] | null | undefined;
@@ -83,8 +111,23 @@ export type OpenClawPluginHookOptions = {
   register?: boolean;
 };
 
+/**
+ * LLM provider 认证方式类型。
+ * - oauth：OAuth 2.0 流程（如 GitHub Copilot、Gemini）
+ * - api_key：直接配置 API key
+ * - token：Bearer token
+ * - device_code：设备码流程
+ * - custom：自定义认证逻辑
+ */
 export type ProviderAuthKind = "oauth" | "api_key" | "token" | "device_code" | "custom";
 
+/**
+ * provider 认证流程的结果。
+ * @property profiles - 认证成功后创建的 auth profile 列表
+ * @property configPatch - 需要写入配置文件的补丁（如默认模型）
+ * @property defaultModel - 推荐使用的默认模型 ID
+ * @property notes - 给用户的提示信息（如 API key 使用注意事项）
+ */
 export type ProviderAuthResult = {
   profiles: Array<{ profileId: string; credential: AuthProfileCredential }>;
   configPatch?: Partial<OpenClawConfig>;
@@ -125,6 +168,11 @@ export type ProviderPlugin = {
   refreshOAuth?: (cred: OAuthCredential) => Promise<OAuthCredential>;
 };
 
+/**
+ * 插件注册的自定义 Gateway RPC 方法。
+ * @property method - 方法名（如 "myplugin.doSomething"）
+ * @property handler - 方法处理器，与核心处理器接口相同
+ */
 export type OpenClawPluginGatewayMethod = {
   method: string;
   handler: GatewayRequestHandler;
@@ -135,7 +183,8 @@ export type OpenClawPluginGatewayMethod = {
 // =============================================================================
 
 /**
- * Context passed to plugin command handlers.
+ * 插件命令处理器的执行上下文，由 Gateway 在命令触发时注入。
+ * 插件命令在 agent 执行之前处理，可绕过 LLM 直接返回结果。
  */
 export type PluginCommandContext = {
   /** The sender's identifier (e.g., Telegram user ID) */
@@ -175,7 +224,13 @@ export type PluginCommandHandler = (
 ) => PluginCommandResult | Promise<PluginCommandResult>;
 
 /**
- * Definition for a plugin-registered command.
+ * 插件自定义渠道命令定义。
+ * 插件命令在内置命令（/reset 等）之前处理，优先级高于 agent 调用。
+ * 适用于简单的状态切换或查询命令，不需要 AI 推理。
+ *
+ * @property name - 命令名（不含前导 /，如 "tts"）
+ * @property description - 命令描述（显示在 /help 和命令菜单中）
+ * @property requireAuth - 是否需要发送者在 allowlist 中（默认 true）
  */
 export type OpenClawPluginCommandDefinition = {
   /** Command name without leading slash (e.g., "tts") */
@@ -227,6 +282,21 @@ export type OpenClawPluginChannelRegistration = {
   dock?: ChannelDock;
 };
 
+/**
+ * 插件定义对象，插件模块的主导出类型。
+ *
+ * 插件可以是对象（OpenClawPluginDefinition）或函数（接收 api 参数）。
+ * register/activate 两个生命周期钩子功能相同，activate 是语义别名。
+ *
+ * 最简单的插件：
+ * ```ts
+ * export default {
+ *   register(api) {
+ *     api.registerTool(myTool);
+ *   }
+ * } satisfies OpenClawPluginDefinition;
+ * ```
+ */
 export type OpenClawPluginDefinition = {
   id?: string;
   name?: string;
@@ -242,6 +312,21 @@ export type OpenClawPluginModule =
   | OpenClawPluginDefinition
   | ((api: OpenClawPluginApi) => void | Promise<void>);
 
+/**
+ * 插件注册 API，在插件 register/activate 生命周期中可用。
+ *
+ * 提供的注册能力：
+ * - registerTool：注册 agent 工具（文件操作、API 调用等）
+ * - registerHook：注册内部钩子（旧版 API，推荐使用 on()）
+ * - registerHttpHandler/Route：注册 HTTP 端点（webhook 入站等）
+ * - registerChannel：注册渠道插件
+ * - registerGatewayMethod：注册自定义 RPC 方法
+ * - registerCli：注册 CLI 命令
+ * - registerService：注册后台服务（随 Gateway 启停）
+ * - registerProvider：注册 LLM provider
+ * - registerCommand：注册渠道命令（绕过 LLM）
+ * - on()：注册生命周期钩子（推荐，类型安全）
+ */
 export type OpenClawPluginApi = {
   id: string;
   name: string;
@@ -296,6 +381,23 @@ export type PluginDiagnostic = {
 // Plugin Hooks
 // ============================================================================
 
+/**
+ * 所有可用的插件钩子名称。
+ *
+ * 执行时机（按 agent 生命周期顺序）：
+ * - gateway_start/stop：Gateway 启停
+ * - before_model_resolve：模型解析前（可覆盖模型选择）
+ * - before_prompt_build：system prompt 构建前（可注入上下文）
+ * - before_agent_start：agent 执行前（兼容旧版，合并上两个）
+ * - llm_input/output：LLM 调用前后
+ * - before_tool_call/after_tool_call：工具调用前后（可拦截/修改）
+ * - tool_result_persist：工具结果持久化
+ * - message_received/sending/sent：消息收发
+ * - session_start/end：会话开始/结束
+ * - subagent_spawning/spawned/ended：子 agent 生命周期
+ * - before_compaction/after_compaction：会话压缩前后
+ * - agent_end：agent 执行完成
+ */
 export type PluginHookName =
   | "before_model_resolve"
   | "before_prompt_build"

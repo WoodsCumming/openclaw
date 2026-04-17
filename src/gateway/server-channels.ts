@@ -9,12 +9,17 @@ import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
 
+/**
+ * 渠道崩溃后的指数退避重启策略。
+ * 初始等待 5 秒，每次翻倍，最长等待 5 分钟，附加 10% 随机抖动防止惊群效应。
+ */
 const CHANNEL_RESTART_POLICY: BackoffPolicy = {
   initialMs: 5_000,
   maxMs: 5 * 60_000,
   factor: 2,
   jitter: 0.1,
 };
+/** 渠道自动重启的最大尝试次数。超过此次数后停止重启并记录错误日志。 */
 const MAX_RESTART_ATTEMPTS = 10;
 
 export type ChannelRuntimeSnapshot = {
@@ -30,6 +35,13 @@ type ChannelRuntimeStore = {
   runtimes: Map<string, ChannelAccountSnapshot>;
 };
 
+/**
+ * 创建空的渠道运行时存储。
+ * 每个渠道拥有独立的存储，包含：
+ * - aborts：每个账户的 AbortController（用于停止渠道）
+ * - tasks：每个账户的运行 Promise（用于等待停止完成）
+ * - runtimes：每个账户的当前运行时快照
+ */
 function createRuntimeStore(): ChannelRuntimeStore {
   return {
     aborts: new Map(),
@@ -38,6 +50,12 @@ function createRuntimeStore(): ChannelRuntimeStore {
   };
 }
 
+/**
+ * 判断账户配置是否处于启用状态。
+ * 若账户对象不存在或未设置 enabled 字段，默认视为启用。
+ * @param account - 渠道账户配置对象
+ * @returns 账户启用时返回 true
+ */
 function isAccountEnabled(account: unknown): boolean {
   if (!account || typeof account !== "object") {
     return true;
@@ -46,6 +64,10 @@ function isAccountEnabled(account: unknown): boolean {
   return enabled !== false;
 }
 
+/**
+ * 获取渠道的默认运行时快照（用于初始化尚未运行的账户状态）。
+ * 优先使用插件定义的 defaultRuntime，回退到仅含 accountId 的最小快照。
+ */
 function resolveDefaultRuntime(channelId: ChannelId): ChannelAccountSnapshot {
   const plugin = getChannelPlugin(channelId);
   return plugin?.status?.defaultRuntime ?? { accountId: DEFAULT_ACCOUNT_ID };
@@ -76,6 +98,22 @@ export type ChannelManager = {
   resetRestartAttempts: (channelId: ChannelId, accountId: string) => void;
 };
 
+/**
+ * 创建渠道生命周期管理器。
+ *
+ * 管理所有渠道账户的启动、停止和自动重启，是 Gateway 中渠道运行时的唯一控制点。
+ *
+ * 核心机制：
+ * - 每个渠道账户有独立的 AbortController 和 Promise 追踪
+ * - 账户崩溃后按 CHANNEL_RESTART_POLICY 指数退避自动重启
+ * - 手动停止的账户标记到 manuallyStopped 集合，不会自动重启
+ * - 通过 plugin.gateway.startAccount / stopAccount 钩子驱动实际启停
+ *
+ * @param opts.loadConfig - 动态加载最新配置的函数（每次启动时调用）
+ * @param opts.channelLogs - 各渠道的子系统日志实例
+ * @param opts.channelRuntimeEnvs - 各渠道的运行时环境
+ * @returns 渠道管理器接口
+ */
 // Channel docking: lifecycle hooks (`plugin.gateway`) flow through this manager.
 export function createChannelManager(opts: ChannelManagerOptions): ChannelManager {
   const { loadConfig, channelLogs, channelRuntimeEnvs } = opts;
@@ -263,10 +301,23 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     );
   };
 
+  /**
+   * 启动指定渠道的一个或所有账户。
+   * 若账户已在运行中（tasks Map 中存在），跳过不重复启动。
+   * @param channelId - 渠道 ID
+   * @param accountId - 可选，指定账户 ID；不传则启动该渠道所有账户
+   */
   const startChannel = async (channelId: ChannelId, accountId?: string) => {
     await startChannelInternal(channelId, accountId);
   };
 
+  /**
+   * 停止指定渠道的一个或所有账户。
+   * 将账户加入 manuallyStopped 集合，阻止自动重启。
+   * 先触发 AbortController，再调用 plugin.gateway.stopAccount（如有），最后等待任务完成。
+   * @param channelId - 渠道 ID
+   * @param accountId - 可选，指定账户 ID；不传则停止该渠道所有账户
+   */
   const stopChannel = async (channelId: ChannelId, accountId?: string) => {
     const plugin = getChannelPlugin(channelId);
     const store = getStore(channelId);
@@ -323,12 +374,23 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     );
   };
 
+  /**
+   * 按注册顺序依次启动所有已注册渠道插件的账户。
+   * Gateway 启动时调用，顺序执行（非并发）以避免资源竞争。
+   */
   const startChannels = async () => {
     for (const plugin of listChannelPlugins()) {
       await startChannel(plugin.id);
     }
   };
 
+  /**
+   * 标记渠道账户已登出（会话失效）。
+   * 更新运行时快照：running=false，connected=false（若原来有 connected 字段）。
+   * @param channelId - 渠道 ID
+   * @param cleared - 若为 true，将 lastError 设为 "logged out"；否则保留原有错误
+   * @param accountId - 可选，不传则使用渠道默认账户
+   */
   const markChannelLoggedOut = (channelId: ChannelId, cleared: boolean, accountId?: string) => {
     const plugin = getChannelPlugin(channelId);
     if (!plugin) {
@@ -353,6 +415,12 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     setRuntime(channelId, resolvedId, next);
   };
 
+  /**
+   * 获取所有渠道账户的当前运行时快照。
+   * 合并持久化的 runtimes 状态与插件的 describeAccount 描述，
+   * 返回按渠道 ID 索引的快照对象，供 Gateway health/status 接口使用。
+   * @returns 包含 channels（默认账户）和 channelAccounts（所有账户）的快照
+   */
   const getRuntimeSnapshot = (): ChannelRuntimeSnapshot => {
     const cfg = loadConfig();
     const channels: ChannelRuntimeSnapshot["channels"] = {};

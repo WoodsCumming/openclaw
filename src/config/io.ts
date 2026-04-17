@@ -274,6 +274,16 @@ function unsetPathForWrite(
   return { changed: false, next: root };
 }
 
+/**
+ * 解析配置快照的 SHA-256 哈希值。
+ *
+ * 优先返回快照上已缓存的 `hash` 字段（避免重复计算），
+ * 若不存在则对 `raw`（原始文件内容字符串）进行即时哈希计算并返回。
+ * `raw` 为 `null`（文件不存在）时对空字符串取哈希。
+ *
+ * 用于 `writeConfigFile` 中记录写前/写后哈希以便追踪变更，以及
+ * 在 gateway 的文件变更检测中快速判断配置是否真正发生了变化。
+ */
 export function resolveConfigSnapshotHash(snapshot: {
   hash?: string;
   raw?: string | null;
@@ -615,6 +625,16 @@ function maybeLoadDotEnvForConfig(env: NodeJS.ProcessEnv): void {
   loadDotEnv({ quiet: true });
 }
 
+/**
+ * 将 JSON5 格式的原始字符串解析为 unknown 对象。
+ *
+ * 使用 JSON5 解析器（默认 `json5` 包），支持注释、尾随逗号等扩展语法。
+ * 解析成功返回 `{ ok: true, parsed }`，失败返回 `{ ok: false, error }` 而非抛出异常，
+ * 便于上层根据是否有效进行分支处理。
+ *
+ * @param raw   - 待解析的 JSON5 字符串（通常来自 `fs.readFileSync(configPath, "utf-8")`）。
+ * @param json5 - 可注入的 JSON5 解析器（用于单元测试替换或自定义解析行为）。
+ */
 export function parseConfigJson5(
   raw: string,
   json5: { parse: (value: string) => unknown } = JSON5,
@@ -670,6 +690,19 @@ type ReadConfigFileSnapshotInternalResult = {
   envSnapshotForRestore?: Record<string, string | undefined>;
 };
 
+/**
+ * 创建一个绑定了具体配置文件路径和依赖项的配置 IO 实例。
+ *
+ * 工厂函数：解析配置文件的实际磁盘路径（优先使用 `OPENCLAW_CONFIG_PATH` 环境变量，
+ * 其次按默认候选路径顺序探测第一个存在的文件），然后返回包含以下方法的对象：
+ * - `configPath`：最终解析出的配置文件路径。
+ * - `loadConfig()`：同步加载配置（读取文件 + 应用运行时覆盖）。
+ * - `readConfigFileSnapshot()`：异步读取完整快照（只读磁盘，不应用运行时覆盖）。
+ * - `readConfigFileSnapshotForWrite()`：同上，但同时返回写入所需的 `writeOptions`。
+ * - `writeConfigFile(cfg, options)`：原子写入配置到磁盘。
+ *
+ * `overrides` 参数用于依赖注入（测试场景下替换 fs、env、homedir 等）。
+ */
 export function createConfigIO(overrides: ConfigIoDeps = {}) {
   const deps = normalizeDeps(overrides);
   const requestedConfigPath = resolveConfigPathForDeps(deps);
@@ -679,6 +712,23 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
   const configPath =
     candidatePaths.find((candidate) => deps.fs.existsSync(candidate)) ?? requestedConfigPath;
 
+  /**
+   * 同步加载并返回完整的运行时配置对象。
+   *
+   * **加载顺序：**
+   * 1. 从 `~/.openclaw/config.json5`（或 `OPENCLAW_CONFIG_PATH` 所指路径）读取磁盘文件。
+   * 2. 解析 `$include` 指令（合并被引用的子配置文件）。
+   * 3. 展开 `${ENV_VAR}` 占位符（先注入 `config.env.vars`，再替换进程环境变量）。
+   * 4. 执行 Schema 验证；验证失败则记录错误并返回空配置 `{}`。
+   * 5. 依次应用各类运行时默认值（model、agent、session、logging、message、compaction 等）。
+   * 6. 可选：触发 login shell 环境变量回退（`shellEnv.enabled = true` 时）。
+   * 7. 调用 `applyConfigOverrides()` 将内存中的运行时覆盖（runtime overrides）合并到最终配置。
+   *
+   * **注意：**
+   * - 文件不存在时直接返回 `{}`，不抛出异常。
+   * - 若配置 Schema 验证失败，同样返回 `{}`，并在 logger.error 中输出详情。
+   * - 此函数不进行缓存；外层 `loadConfig()` 导出函数负责短时（200ms）缓存。
+   */
   function loadConfig(): OpenClawConfig {
     try {
       maybeLoadDotEnvForConfig(deps.env);
@@ -1015,11 +1065,32 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     }
   }
 
+  /**
+   * 异步读取配置文件快照（只读磁盘，不应用运行时覆盖）。
+   *
+   * **与 `loadConfig()` 的区别：**
+   * - `loadConfig()` 是同步的，最终会调用 `applyConfigOverrides()` 将内存运行时覆盖合并进来，
+   *   返回的是"当前生效的运行时配置"。
+   * - `readConfigFileSnapshot()` 是异步的，**不**应用运行时覆盖，返回的是纯粹的磁盘快照，
+   *   包含原始文件内容（`raw`）、解析结果（`parsed`）、解析后的配置（`resolved`/`config`）
+   *   以及验证错误（`issues`）、遗留问题（`legacyIssues`）等元信息。
+   * - 适用于 `openclaw config get/set/unset`、诊断命令、UI 配置展示等只读操作。
+   */
   async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
     const result = await readConfigFileSnapshotInternal();
     return result.snapshot;
   }
 
+  /**
+   * 异步读取配置文件快照，同时返回写入所需的辅助选项。
+   *
+   * 在 `readConfigFileSnapshot()` 基础上，额外返回 `writeOptions`：
+   * - `envSnapshotForRestore`：读取时的环境变量快照，供 `writeConfigFile` 用于还原
+   *   `${ENV_VAR}` 占位符（避免将已解析的真实值写回文件）。
+   * - `expectedConfigPath`：绑定此次读取的配置路径，确保写入时路径一致（防止 TOCTOU 问题）。
+   *
+   * 应在需要"读取后立即写入"的场景中使用（如 `config set`），以保证环境变量引用的完整性。
+   */
   async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
     const result = await readConfigFileSnapshotInternal();
     return {
@@ -1031,6 +1102,27 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
     };
   }
 
+  /**
+   * 将配置对象原子写入磁盘。
+   *
+   * **写入流程：**
+   * 1. 读取当前磁盘快照（`readConfigFileSnapshotInternal`），计算新旧差异（merge patch）。
+   * 2. 将差异应用到快照中已解析但未展开运行时默认值的 `resolved` 字段，避免把运行时默认值持久化到文件。
+   * 3. 尝试还原配置中已解析的 `${ENV_VAR}` 占位符（使用读取时的环境变量快照），
+   *    确保不将真实 API key 等敏感值覆盖写入文件。
+   * 4. 执行 Schema 验证；验证失败则抛出 `Error`（不写入文件）。
+   * 5. 生成 JSON 字符串并先写入临时文件（`configPath.<pid>.<uuid>.tmp`），
+   *    再通过 `fs.rename`（原子重命名）替换目标文件。
+   *    在 Windows 上 rename 可能因目标文件已存在而失败，此时回退到 `copyFile` 方式。
+   * 6. 在写入前自动备份原文件（`configPath.bak`）并轮转历史备份。
+   * 7. 向审计日志（`~/.openclaw/logs/config-audit.jsonl`）追加一条写入记录。
+   *
+   * **注意事项：**
+   * - 写入**不会触发**热重载（文件系统 watcher 由 gateway 侧管理，与此函数无直接关联）；
+   *   写入完成后需由调用方通知 gateway 重新加载配置。
+   * - 不会向写入的文件中注入运行时默认值（避免把默认值"固化"到用户配置文件里）。
+   * - 调用此函数前会执行 `clearConfigCache()`，使下次 `loadConfig()` 强制重新读取磁盘。
+   */
   async function writeConfigFile(cfg: OpenClawConfig, options: ConfigWriteOptions = {}) {
     clearConfigCache();
     let persistCandidate: unknown = cfg;
@@ -1323,10 +1415,26 @@ function shouldUseConfigCache(env: NodeJS.ProcessEnv): boolean {
   return resolveConfigCacheMs(env) > 0;
 }
 
+/**
+ * 清除短时内存配置缓存（默认 TTL 为 200ms）。
+ *
+ * 在 `writeConfigFile()` 写入完成后自动调用，确保下次 `loadConfig()` 从磁盘重新读取。
+ * 测试场景中也可手动调用以强制刷新。
+ */
 export function clearConfigCache(): void {
   configCache = null;
 }
 
+/**
+ * 设置运行时配置快照，使 `loadConfig()` 直接返回该值而不读取磁盘。
+ *
+ * 用于 gateway 热重载场景：gateway 在收到配置变更通知后，将新配置预处理好并通过此函数注入，
+ * 后续所有 `loadConfig()` 调用将直接使用内存中的最新版本，无需每次重新解析磁盘文件。
+ *
+ * @param config       - 要注入的运行时配置（已应用所有默认值和覆盖）。
+ * @param sourceConfig - 原始磁盘配置（未应用运行时覆盖）；供 `writeConfigFile` 在写入时
+ *                       通过差异计算还原用户真实修改，避免将运行时注入值写回文件。
+ */
 export function setRuntimeConfigSnapshot(
   config: OpenClawConfig,
   sourceConfig?: OpenClawConfig,
@@ -1336,16 +1444,45 @@ export function setRuntimeConfigSnapshot(
   clearConfigCache();
 }
 
+/**
+ * 清除运行时配置快照，使后续 `loadConfig()` 重新从磁盘读取文件。
+ *
+ * 通常在 gateway 关闭或需要强制重新加载时调用。
+ */
 export function clearRuntimeConfigSnapshot(): void {
   runtimeConfigSnapshot = null;
   runtimeConfigSourceSnapshot = null;
   clearConfigCache();
 }
 
+/**
+ * 返回当前内存中的运行时配置快照（未设置时返回 `null`）。
+ *
+ * 可用于判断当前是否处于"热重载注入"模式，以及获取 gateway 当前生效的配置副本。
+ */
 export function getRuntimeConfigSnapshot(): OpenClawConfig | null {
   return runtimeConfigSnapshot;
 }
 
+/**
+ * 加载并返回当前生效的运行时配置（模块级入口，含缓存与运行时快照短路逻辑）。
+ *
+ * **加载顺序：**
+ * 1. 若已通过 `setRuntimeConfigSnapshot()` 注入运行时快照，直接返回快照（热重载模式）。
+ * 2. 否则，检查短时内存缓存（TTL 默认 200ms，可通过 `OPENCLAW_CONFIG_CACHE_MS` 调整）：
+ *    缓存命中且路径一致则直接返回缓存值。
+ * 3. 创建 `ConfigIO` 实例并调用其 `loadConfig()`，执行完整的文件读取 + 默认值应用流程。
+ * 4. 将结果写入缓存后返回。
+ *
+ * **配置文件路径（默认）：** `~/.openclaw/config.json5`，
+ * 可通过环境变量 `OPENCLAW_CONFIG_PATH` 覆盖。
+ *
+ * **环境变量覆盖：** 配置文件中的 `${ENV_VAR}` 占位符在加载时被替换为进程环境变量的值；
+ * `config.env.vars` 中定义的变量也会在替换前注入到环境中。
+ *
+ * **热重载机制：** gateway 在文件系统 watcher 检测到配置变更后，会重新调用此函数（或直接调用
+ * `setRuntimeConfigSnapshot()`），确保后续请求使用最新配置。
+ */
 export function loadConfig(): OpenClawConfig {
   if (runtimeConfigSnapshot) {
     return runtimeConfigSnapshot;
@@ -1373,14 +1510,44 @@ export function loadConfig(): OpenClawConfig {
   return config;
 }
 
+/**
+ * 异步读取配置文件快照（模块级入口）。
+ *
+ * 与 `loadConfig()` 的核心区别：
+ * - **只读磁盘**，不调用 `applyConfigOverrides()`，不受内存运行时覆盖影响。
+ * - 返回 `ConfigFileSnapshot`，包含完整的元信息：原始文件内容（`raw`）、哈希（`hash`）、
+ *   解析后的配置（`resolved` 和 `config`）、验证错误（`issues`）、遗留警告（`legacyIssues`）。
+ * - 适用于 `openclaw config get/status` 等诊断和只读命令。
+ *
+ * 每次调用都会创建新的 `ConfigIO` 实例，不受模块级缓存影响（注意：`OPENCLAW_CONFIG_PATH`
+ * 等环境变量在调用时动态解析，测试中修改环境变量后立即生效）。
+ */
 export async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
   return await createConfigIO().readConfigFileSnapshot();
 }
 
+/**
+ * 异步读取配置文件快照并附带写入选项（模块级入口）。
+ *
+ * 在 `readConfigFileSnapshot()` 基础上额外返回 `writeOptions`（含环境变量快照），
+ * 适用于"读取 → 修改 → 写入"的完整配置操作流程（如 `config set/unset`）。
+ *
+ * @see readConfigFileSnapshotForWrite（`createConfigIO` 实例方法）
+ */
 export async function readConfigFileSnapshotForWrite(): Promise<ReadConfigFileSnapshotForWriteResult> {
   return await createConfigIO().readConfigFileSnapshotForWrite();
 }
 
+/**
+ * 将配置对象原子写入磁盘（模块级入口）。
+ *
+ * 在实例方法 `writeConfigFile` 的基础上，额外处理运行时快照模式：
+ * 若当前存在运行时快照（`runtimeConfigSnapshot`），则先通过 merge patch 算法计算出
+ * 调用方相对于运行时快照的变更，再将变更应用到原始磁盘配置（`runtimeConfigSourceSnapshot`）上，
+ * 从而确保只将用户实际修改的内容持久化，而不会把运行时注入的临时值写回文件。
+ *
+ * @see writeConfigFile（`createConfigIO` 实例方法）获取完整的写入流程说明。
+ */
 export async function writeConfigFile(
   cfg: OpenClawConfig,
   options: ConfigWriteOptions = {},

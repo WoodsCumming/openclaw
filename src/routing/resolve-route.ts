@@ -18,11 +18,27 @@ import {
 /** @deprecated Use ChatType from channels/chat-type.js */
 export type RoutePeerKind = ChatType;
 
+/**
+ * 路由中的 peer（对话对象）标识，由消息类型和 ID 组成。
+ * @property kind - 聊天类型：direct（私聊）/ group（群组）/ thread（线程）
+ * @property id - 渠道内的 peer 唯一标识（如 Telegram chat_id、Discord channel_id）
+ */
 export type RoutePeer = {
   kind: ChatType;
   id: string;
 };
 
+/**
+ * 路由解析的输入参数，描述一条入站消息的完整上下文。
+ * @property cfg - 当前 OpenClaw 配置（含 bindings 路由规则）
+ * @property channel - 渠道 ID（如 "telegram"、"discord"）
+ * @property accountId - 渠道账户 ID（多账户渠道时区分）
+ * @property peer - 消息来源 peer（私聊/群组/线程）
+ * @property parentPeer - 线程的父 peer（用于线程 binding 继承）
+ * @property guildId - 服务器/工作区 ID（Discord guild、Slack workspace）
+ * @property teamId - 团队 ID
+ * @property memberRoleIds - 消息发送者的角色 ID 列表（Discord roles）
+ */
 export type ResolveAgentRouteInput = {
   cfg: OpenClawConfig;
   channel: string;
@@ -36,6 +52,15 @@ export type ResolveAgentRouteInput = {
   memberRoleIds?: string[];
 };
 
+/**
+ * 路由解析结果，确定处理该消息的 agent 和会话。
+ * @property agentId - 目标 agent ID
+ * @property channel - 规范化后的渠道 ID
+ * @property accountId - 规范化后的账户 ID
+ * @property sessionKey - 完整会话 key，用于持久化和并发控制
+ * @property mainSessionKey - 主会话 key（DM 折叠用，所有 DM 共享）
+ * @property matchedBy - 命中的 binding 层级，用于调试日志
+ */
 export type ResolvedAgentRoute = {
   agentId: string;
   channel: string;
@@ -58,10 +83,12 @@ export type ResolvedAgentRoute = {
 
 export { DEFAULT_ACCOUNT_ID, DEFAULT_AGENT_ID } from "./session-key.js";
 
+/** 规范化 token 字符串：trim + lowercase，用于渠道 ID / accountId 等的比对。 */
 function normalizeToken(value: string | undefined | null): string {
   return (value ?? "").trim().toLowerCase();
 }
 
+/** 规范化 ID 值：将字符串 trim，数字转字符串，其他返回空字符串。 */
 function normalizeId(value: unknown): string {
   if (typeof value === "string") {
     return value.trim();
@@ -72,6 +99,12 @@ function normalizeId(value: unknown): string {
   return "";
 }
 
+/**
+ * 判断 binding 的 accountId 模式是否匹配实际账户 ID。
+ * - 空模式：匹配默认账户（DEFAULT_ACCOUNT_ID）
+ * - "*"：匹配任意账户
+ * - 其他：规范化后精确匹配
+ */
 function matchesAccountId(match: string | undefined, actual: string): boolean {
   const trimmed = (match ?? "").trim();
   if (!trimmed) {
@@ -83,6 +116,22 @@ function matchesAccountId(match: string | undefined, actual: string): boolean {
   return normalizeAccountId(trimmed) === actual;
 }
 
+/**
+ * 根据路由上下文构建 agent 会话 key。
+ *
+ * 会话 key 格式取决于 dmScope 配置：
+ * - main：所有 DM 共享 `agent-{id}:main`
+ * - per-peer：每个 peer 独立 `agent-{id}:...:peer-{peerId}`
+ * - per-channel-peer：渠道 + peer 隔离
+ * - per-account-channel-peer：账户 + 渠道 + peer 完全隔离
+ *
+ * @param params.agentId - agent ID
+ * @param params.channel - 渠道 ID
+ * @param params.peer - peer 信息（可选）
+ * @param params.dmScope - DM 会话作用域（来自配置 session.dmScope）
+ * @param params.identityLinks - 身份链接映射（用于跨渠道会话合并）
+ * @returns 小写规范化的会话 key 字符串
+ */
 export function buildAgentSessionKey(params: {
   agentId: string;
   channel: string;
@@ -172,6 +221,18 @@ type EvaluatedBindingsCache = {
 const evaluatedBindingsCacheByCfg = new WeakMap<OpenClawConfig, EvaluatedBindingsCache>();
 const MAX_EVALUATED_BINDINGS_CACHE_KEYS = 2000;
 
+/**
+ * 获取指定渠道账户的已评估 binding 列表（带缓存）。
+ *
+ * 缓存策略：以 OpenClawConfig 对象为 WeakMap key，
+ * 配置未变化时命中缓存，配置对象更换时自动失效。
+ * 单个配置对象的缓存条目上限为 2000 个渠道账户组合。
+ *
+ * @param cfg - 当前配置
+ * @param channel - 规范化渠道 ID
+ * @param accountId - 规范化账户 ID
+ * @returns 已过滤出匹配该渠道+账户的 binding 列表
+ */
 function getEvaluatedBindingsForChannelAccount(
   cfg: OpenClawConfig,
   channel: string,
@@ -288,6 +349,25 @@ function matchesBindingScope(match: NormalizedBindingMatch, scope: BindingScope)
   return true;
 }
 
+/**
+ * 核心路由解析函数：将入站消息映射到 (agentId, sessionKey)。
+ *
+ * 按优先级依次匹配 8 个 binding 层级：
+ * 1. binding.peer — 精确匹配 peer ID（最高优先级）
+ * 2. binding.peer.parent — 匹配父 peer（线程继承）
+ * 3. binding.guild+roles — guild + 成员角色组合匹配
+ * 4. binding.guild — guild 级别匹配
+ * 5. binding.team — team 级别匹配
+ * 6. binding.account — 账户级别匹配
+ * 7. binding.channel — 渠道级别匹配（accountId="*"）
+ * 8. default — 使用配置中的默认 agent
+ *
+ * 每个层级找到第一个匹配的 binding 后立即返回，不继续向下匹配。
+ * 开启 verbose 日志时输出详细匹配过程。
+ *
+ * @param input - 路由输入（含消息上下文和配置）
+ * @returns 路由结果（agentId + sessionKey + matchedBy）
+ */
 export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentRoute {
   const channel = normalizeToken(input.channel);
   const accountId = normalizeAccountId(input.accountId);
