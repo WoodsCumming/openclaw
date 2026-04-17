@@ -244,6 +244,7 @@ function classifyCompactionReason(reason?: string): string {
  * Core compaction logic without lane queueing.
  * Use this when already inside a session/global lane to avoid deadlocks.
  */
+// ! （Direct 版本，Lane 内调用）
 export async function compactEmbeddedPiSessionDirect(
   params: CompactEmbeddedPiSessionParams,
 ): Promise<EmbeddedPiCompactResult> {
@@ -513,6 +514,7 @@ export async function compactEmbeddedPiSessionDirect(
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
 
+    // ! 写锁防止多进程并发修改同一会话文件
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
       maxHoldMs: resolveSessionLockMaxHoldFromTimeout({
@@ -748,6 +750,7 @@ export async function compactEmbeddedPiSessionDirect(
  * Use this from outside a lane context. If already inside a lane, use
  * `compactEmbeddedPiSessionDirect` to avoid deadlocks.
  */
+// ! （带 Lane 的版本，Lane 外调用）
 export async function compactEmbeddedPiSession(
   params: CompactEmbeddedPiSessionParams,
 ): Promise<EmbeddedPiCompactResult> {

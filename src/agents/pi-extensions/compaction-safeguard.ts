@@ -192,6 +192,7 @@ async function readWorkspaceContextForSummary(): Promise<string> {
   }
 }
 
+// ! OpenClaw 的摘要通过 compactionSafeguardExtension 在 Pi SDK 的 session_before_compact 事件中增强：
 export default function compactionSafeguardExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", async (event, ctx) => {
     const { preparation, customInstructions, signal } = event;
@@ -201,13 +202,27 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       );
       return { cancel: true };
     }
+    // ! // 附加文件操作记录
     const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
     const fileOpsSummary = formatFileOperations(readFiles, modifiedFiles);
+    // 格式：
+    // <read-files>
+    // src/agents/compaction.ts
+    // </read-files>
+    // <modified-files>
+    // src/gateway/auth.ts
+    // </modified-files>
+
+    // ! // 附加工具失败记录
     const toolFailures = collectToolFailures([
       ...preparation.messagesToSummarize,
       ...preparation.turnPrefixMessages,
     ]);
     const toolFailureSection = formatToolFailuresSection(toolFailures);
+    // 格式：
+    // ## Tool Failures
+    // - read_file (exitCode=1): permission denied
+    // - bash: command not found: npm
 
     // Model resolution: ctx.model is undefined in compact.ts workflow (extensionRunner.initialize() is never called).
     // Fall back to runtime.model which is explicitly passed when building extension paths.
@@ -258,6 +273,9 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
         const maxHistoryTokens = Math.floor(contextWindowTokens * maxHistoryShare * SAFETY_MARGIN);
 
         if (newContentTokens > maxHistoryTokens) {
+          // 若新内容 token 数超过历史预算（contextWindow × maxHistoryShare × SAFETY_MARGIN）
+          // 先对旧历史执行 pruneHistoryForContextShare，丢弃最旧的消息块
+          // 被丢弃的消息块会被单独摘要化，作为 previousSummary 传入主摘要
           const pruned = pruneHistoryForContextShare({
             messages: messagesToSummarize,
             maxContextTokens: contextWindowTokens,
@@ -286,6 +304,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   Math.floor(contextWindowTokens * droppedChunkRatio) -
                     SUMMARIZATION_OVERHEAD_TOKENS,
                 );
+                // ! // 丢弃部分单独摘要，作为 droppedSummary
                 droppedSummary = await summarizeInStages({
                   messages: pruned.droppedMessagesList,
                   model,
@@ -324,6 +343,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       // incorporates context from pruned messages instead of losing it entirely.
       const effectivePreviousSummary = droppedSummary ?? preparation.previousSummary;
 
+      // ! // 核心摘要（Pi SDK 生成）
       const historySummary = await summarizeInStages({
         messages: messagesToSummarize,
         model,
@@ -356,7 +376,9 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       summary += fileOpsSummary;
 
       // Append workspace critical context (Session Startup + Red Lines from AGENTS.md)
+      // ! // 附加工作区关键规则
       const workspaceContext = await readWorkspaceContextForSummary();
+      // ! // 从 AGENTS.md 提取 "Session Startup" 和 "Red Lines" 章节（最多 2000 字符）
       if (workspaceContext) {
         summary += workspaceContext;
       }

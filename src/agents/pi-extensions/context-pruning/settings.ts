@@ -47,11 +47,11 @@ export type EffectiveContextPruningSettings = {
 
 export const DEFAULT_CONTEXT_PRUNING_SETTINGS: EffectiveContextPruningSettings = {
   mode: "cache-ttl",
-  ttlMs: 5 * 60 * 1000,
-  keepLastAssistants: 3,
-  softTrimRatio: 0.3,
-  hardClearRatio: 0.5,
-  minPrunableToolChars: 50_000,
+  ttlMs: 5 * 60 * 1000, // ! // 缓存 TTL：5 分钟
+  keepLastAssistants: 3,  // ! // 保护最近 3 个 assistant 轮次
+  softTrimRatio: 0.3, // ! // 软修剪触发：上下文使用 30%
+  hardClearRatio: 0.5,  // ! // 硬清除触发：上下文使用 50%
+  minPrunableToolChars: 50_000, // ! // 最小可修剪工具结果字符数
   tools: {},
   softTrim: {
     maxChars: 4_000,

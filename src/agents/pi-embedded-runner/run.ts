@@ -508,7 +508,7 @@ export async function runEmbeddedPiAgent(
         }
       }
 
-      const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
+      const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3; // ! // 溢出后最多压缩 3 次
       const MAX_RUN_LOOP_ITERATIONS = resolveMaxRunRetryIterations(profileCandidates.length);
       let overflowCompactionAttempts = 0;
       let toolResultTruncationAttempted = false;
@@ -768,6 +768,7 @@ export async function runEmbeddedPiAgent(
             // Fallback: try truncating oversized tool results in the session.
             // This handles the case where a single tool result exceeds the
             // context window and compaction cannot reduce it further.
+            // ! // 压缩无法解决时的最后手段：单条工具结果体积过大
             if (!toolResultTruncationAttempted) {
               const contextWindowTokens = ctxInfo.tokens;
               const hasOversized = attempt.messagesSnapshot
@@ -796,12 +797,14 @@ export async function runEmbeddedPiAgent(
                   sessionId: params.sessionId,
                   sessionKey: params.sessionKey,
                 });
+                // ! // 直接修改 JSONL 会话文件，截断超大工具结果
                 if (truncResult.truncated) {
                   log.info(
                     `[context-overflow-recovery] Truncated ${truncResult.truncatedCount} tool result(s); retrying prompt`,
                   );
                   // Do NOT reset overflowCompactionAttempts here — the global cap must remain
                   // enforced across all iterations to prevent unbounded compaction cycles (OC-65).
+                  // ! // 重试 agent
                   continue;
                 }
                 log.warn(
